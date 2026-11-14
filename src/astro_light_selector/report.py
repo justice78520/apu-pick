@@ -6,6 +6,7 @@ import csv
 from collections import Counter
 from pathlib import Path
 
+from .fileio import atomic_write
 from .i18n import normalize_error, tr, tr_metric
 from .metrics import FrameMetrics
 from .pipeline import frame_key
@@ -123,8 +124,8 @@ def write_csv(decisions: list[Decision], path: Path, root: Path | None = None) -
     """root 是開啟的資料夾：file 欄寫相對於它的路徑；沒給就用報表所在的資料夾。"""
     root = path.parent if root is None else root
     path.parent.mkdir(parents=True, exist_ok=True)
-    # utf-8-sig 讓 Excel 直接開也不會亂碼
-    with path.open("w", newline="", encoding="utf-8-sig") as fh:
+    # utf-8-sig 讓 Excel 直接開也不會亂碼；先寫暫存檔再換名，寫到一半當機不會只剩半份報表
+    with atomic_write(path, newline="", encoding="utf-8-sig") as fh:
         writer = csv.DictWriter(fh, fieldnames=COLUMNS)
         writer.writeheader()
         for d in decisions:

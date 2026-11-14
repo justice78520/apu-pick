@@ -1,0 +1,50 @@
+# 每次 push 到 master（或開 PR）就在雲端的 Windows 和 Mac 上跑測試，改壞了馬上知道，不用等到發布才發現。
+name: 測試
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      PYTHONUNBUFFERED: "1"  # 輸出即時出現在記錄裡，卡住時才看得出卡在哪
+      PYTHONUTF8: "1"        # 中文訊息與檔名用 UTF-8，不受雲端機的系統語系影響
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: 安裝
+        run: python -m pip install -e ".[gui]" pytest
+
+      - name: 測試（核心）
+        timeout-minutes: 15
+        # 單一測試超過 4 分鐘就印出每個執行緒卡在哪一行
+        run: python -m pytest -v --ignore=tests/test_gui.py -o faulthandler_timeout=240
+
+      # 視窗測試要用到雲端機的圖形環境；失敗會標示出來，但不算整個失敗
+      - name: 測試（視窗）
+        timeout-minutes: 10
+        continue-on-error: true
+        run: python -m pytest -v tests/test_gui.py -o faulthandler_timeout=120

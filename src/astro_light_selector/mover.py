@@ -8,6 +8,7 @@ import re
 import shutil
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 
+from .fileio import atomic_write
 from .metrics import is_image
 from .selector import Decision
 
@@ -26,6 +27,8 @@ def read_move_log(reject_dir: Path) -> dict[Path, Path]:
     entries: dict[Path, Path] = {}
     with log.open(newline="", encoding="utf-8-sig") as fh:
         for row in csv.DictReader(fh):
+            if not row.get("source") or not row.get("target"):
+                continue  # 寫到一半被中斷的最後一行、或被改壞的紀錄：略過，不要整份讀不了
             src, target = Path(row["source"]).resolve(), Path(row["target"]).resolve()
             if target.parent != reject_dir:
                 src, target = _relocate(row["source"], row["target"], reject_dir, src, target)
@@ -64,11 +67,25 @@ def write_move_log(reject_dir: Path, entries: dict[Path, Path]) -> None:
     if not entries:
         log.unlink(missing_ok=True)
         return
-    with log.open("w", newline="", encoding="utf-8-sig") as fh:
+    with atomic_write(log, newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
         w.writerow(["source", "target"])
         for src, target in entries.items():
             w.writerow([str(src), str(target)])
+
+
+def _append_move(reject_dir: Path, src: Path, target: Path) -> None:
+    """每搬一張就在紀錄最後補一行：搬到一半程式被強制關掉、斷電，已經搬走的也都有紀錄可以還原。
+
+    全部搬完 sync_files 會再整份重寫一次（清掉搬回去的）。
+    """
+    log = reject_dir / MOVE_LOG
+    new = not log.exists()
+    with log.open("a", newline="", encoding="utf-8-sig" if new else "utf-8") as fh:
+        w = csv.writer(fh)
+        if new:
+            w.writerow(["source", "target"])
+        w.writerow([str(src), str(target)])
 
 
 def moved_away(reject_dir: Path, folder: Path) -> dict[Path, Path]:
@@ -136,6 +153,7 @@ def sync_files(decisions: list[Decision], reject_dir: Path,
                     reject_dir.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(home), str(target))
                     log[home] = target.resolve()
+                    _append_move(reject_dir, home, log[home])
                 moved_out.append(target)
     finally:
         # 中途出錯也要把已經搬完的記下來，下次才搬得回來

@@ -611,3 +611,140 @@ def test_gui_field_pane(tmp_path: Path, make_app, isolated_settings: Path):
     _pump(app.root, lambda: any(k.startswith("avg:") for k in app._field_cache))
     assert "5 張平均" in app.field_text.get("1.0", "end")
     assert json.loads((isolated_settings / "settings.json").read_text(encoding="utf-8"))["field_mode"] == "average"
+
+
+def test_update_badge_shows_only_for_a_newer_version(tmp_path: Path, make_app, monkeypatch):
+    """有新版才出現下載鍵；一樣的版本不出現；關掉檢查就收起來，再打開用存起來的結果、不連網。"""
+    from astro_light_selector import gui
+
+    opened, fetched = [], []
+    monkeypatch.setattr(gui.webbrowser, "open", opened.append)
+    monkeypatch.setattr(gui.update, "fetch_latest", lambda *a, **k: fetched.append(1) or {})
+    app = make_app(tmp_path)
+    root = app.root
+    assert app.update_badge.winfo_manager() == ""                      # 一開始沒有
+    app.events.put(("update", {"tag_name": f"v{gui.__version__}", "assets": []}))
+    _pump(root, lambda: gui.update.cached() is not None)
+    assert app.update_info is None and app.update_badge.winfo_manager() == ""
+    zip_name = f"APUPick-99.0.0-{gui.update.platform_tag()}.zip"
+    newer = {"tag_name": "v99.0.0", "html_url": "https://github.com/x/releases/tag/v99.0.0",
+             "assets": [{"name": zip_name, "browser_download_url": "https://github.com/x/dl.zip"}]}
+    app.events.put(("update", newer))
+    _pump(root, lambda: app.update_info is not None)
+    assert app.update_badge.winfo_manager() == "pack" and "99.0.0" in app.update_label.cget("text")
+    app.open_update()
+    assert opened == ["https://github.com/x/dl.zip"]
+    app.rebuild()                                                       # 換語言重建後還在
+    assert app.update_badge.winfo_manager() == "pack"
+    app.update_check_var.set(False)                                     # 說明選單關掉檢查
+    assert app.update_badge.winfo_manager() == "" and not gui.update.enabled()
+    app.update_check_var.set(True)                                      # 再打開：一天內用存起來的結果，不連網
+    assert app.update_info.version == "99.0.0" and fetched == []
+
+
+def test_gui_sort_mixed_folder_names(tmp_path: Path, make_app):
+    """「資料夾」欄有的是純數字（20260101）、有的是文字或空的：排序不能出錯。"""
+    app = make_app(tmp_path)
+    for i, folder in enumerate(("night2", "20260102", "", "20260101", "-")):
+        app.tree.insert("", "end", iid=f"r{i}", values=("x.fits", folder))
+    app._sort_by("folder")
+    assert [app.tree.set(i, "folder") for i in app.tree.get_children()] == ["20260101", "20260102", "", "night2", "-"]
+    app._sort_by("folder")  # 再點一次反過來
+    assert app.tree.set(app.tree.get_children()[0], "folder") == "-"
+
+
+def test_unexpected_errors_are_logged_and_shown(tmp_path: Path, monkeypatch, isolated_settings: Path, dialogs):
+    from astro_light_selector import errorlog, gui
+
+    monkeypatch.setattr(gui, "_last_error_dialog", 0.0)
+    monkeypatch.setattr(gui.time, "monotonic", lambda: 1000.0)
+    try:
+        raise KeyError("壞掉了")
+    except KeyError as exc:
+        gui.report_unexpected(type(exc), exc, exc.__traceback__)
+        gui.report_unexpected(type(exc), exc, exc.__traceback__)   # 10 秒內第二次：只記、不再跳視窗
+    log = errorlog.log_path().read_text(encoding="utf-8")
+    assert log.count("KeyError") >= 2 and "APU Pick" in log and "test_unexpected_errors" in log
+    assert len(dialogs["errors"]) == 1 and "error.log" in dialogs["errors"][0]
+    dialogs["errors"].clear()
+
+
+def test_gui_stop_keeps_results_and_measure_new(tmp_path: Path, make_app, isolated_settings: Path):
+    """按停止：量好的留著；「量測新檔案」只補沒量過的。門檻方式、分組開關下次開還在。"""
+    import json
+
+    from astro_light_selector import pipeline
+
+    files = make_session(tmp_path, n_good=4)
+    app = make_app(tmp_path)
+    root = app.root
+    n = len(files["good"]) + len(files["bad"])
+    assert "disabled" in app.new_btn.state()
+    real = pipeline.measure
+
+    def stop_after_three(path):
+        m = real(path)
+        if sum(1 for _ in app.events.queue) >= 2:
+            app.cancel.set()
+        return m
+
+    pipeline.measure = stop_after_three
+    try:
+        app._start_measure()
+        _pump(root, lambda: not app.is_busy() and "已停止" in app.status_var.get())
+    finally:
+        pipeline.measure = real
+    kept = len(app.frames)
+    assert 0 < kept < n and "量測新檔案" in app.status_var.get()
+    assert "disabled" not in app.new_btn.state()
+
+    app._measure_new()
+    _pump(root, lambda: not app.is_busy() and len(app.frames) == n)
+    assert f"共 {n} 張" in app.status_var.get()
+    assert len(app.selection.decisions) == n
+    app._measure_new()            # 沒有新檔案：只跳說明，不量
+    assert not app.is_busy()
+
+    app.method_var.set("min_score")
+    app.min_score_var.set(60)
+    app.group_night_var.set(True)
+    app._apply()
+    saved = json.loads((isolated_settings / "settings.json").read_text(encoding="utf-8"))
+    assert saved["threshold"]["method"] == "min_score" and "night" in saved["group_keys"]
+    again = make_app(tmp_path)
+    assert again.method_var.get() == "min_score" and again.min_score_var.get() == 60
+    assert again.group_night_var.get() and again.group_filter_var.get()
+
+
+def test_field_grid_and_quad(tmp_path: Path, make_app, isolated_settings: Path):
+    """像場：九宮格是實際照片裁的九塊；四邊形往星點大的那一側凸。"""
+    import json
+
+    import numpy as np
+
+    from astro_light_selector import detail
+    from astro_light_selector.field import TILE, analyze_frame
+
+    from .synth import make_star_field, write_fits
+
+    shape = (600, 900)
+    left = make_star_field(shape=shape, n_stars=900, fwhm=3.0, seed=1)
+    right = make_star_field(shape=shape, n_stars=900, fwhm=4.5, seed=2)
+    tilted = np.where(np.arange(shape[1])[None, :] < shape[1] * 2 // 3, left, right).astype(np.uint16)
+    result = analyze_frame(write_fits(tmp_path / "tilted.fits", tilted))
+    assert len(result.tiles) == 3 and all(t.shape == (TILE, TILE) and t.dtype == np.uint8
+                                          for row in result.tiles for t in row)
+    assert result.tiles[0][0].max() > result.tiles[0][0].min()      # 有東西，不是一片黑
+    points = detail.quad_points(result)
+    assert points["tr"][0] > 1.0 > points["tl"][0] > 0 or points["tr"][0] > 1.0 > -points["tl"][0]
+    assert abs(points["tr"][0]) > abs(points["tl"][0]) and abs(points["br"][1]) > abs(points["bl"][1])
+
+    app = make_app(tmp_path)
+    for view in ("grid", "quad"):
+        detail.draw_field(app.field_fig, result, "", view)
+        app.field_canvas.draw()
+        assert len(app.field_fig.axes) == 1
+    assert "九宮格" in "".join(line for line, _ in detail.field_lines(result, "grid"))
+    assert "四邊形" in "".join(line for line, _ in detail.field_lines(result, "quad"))
+    app.field_view_var.set("quad")
+    assert json.loads((isolated_settings / "settings.json").read_text(encoding="utf-8"))["field_view"] == "quad"

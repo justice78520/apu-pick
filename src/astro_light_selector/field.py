@@ -1,4 +1,5 @@
 """像場分析：把畫面切成 3×3，每區分開量星點的 FWHM、離心率和拉長的方向，看感光元件有沒有傾斜、像場彎不彎。
+另外從照片的四角、四邊、中央各裁一小塊（九宮格），讓人直接看星點的樣子。
 
 - 傾斜：四個角的 FWHM 最大減最小，除以四角平均（百分比，跟 ASTAP 的算法一樣）
 - 場曲：四角平均比中間大多少（百分比）
@@ -16,17 +17,16 @@ from pathlib import Path
 
 import numpy as np
 from astropy.stats import sigma_clipped_stats
-from photutils.detection import IRAFStarFinder
-from scipy.ndimage import uniform_filter
 
-from .metrics import (CUTOUT_HALF, DETECT_FWHM, DETECT_SIGMA, HOT_PIXEL_CONCENTRATION, SIGMA_TO_FWHM, _cfa_bin,
-                      _saturation_level, _superpixel, load_image, star_fit)
+from .metrics import (CUTOUT_HALF, DETECT_FWHM, SIGMA_TO_FWHM, _cfa_bin, _saturation_level, _superpixel, find_stars,
+                      load_image, star_fit)
 
 GRID = 3
 STARS_PER_CELL = 25        # 每區擬合幾顆
 MAX_ATTEMPTS_PER_CELL = 120
 MIN_STARS_PER_CELL = 5     # 少於這麼多顆，這一區不算
 CORNERS = {"tl": (0, 0), "tr": (0, GRID - 1), "bl": (GRID - 1, 0), "br": (GRID - 1, GRID - 1)}
+TILE = 96                  # 九宮格每格從照片裁多大一塊（彩色相機是合成 super-pixel 之後的像素）
 
 
 @dataclass
@@ -43,6 +43,8 @@ class FieldResult:
     cells: list[list[Cell | None]]
     n_frames: int = 1
     notes: list[str] = field(default_factory=list)   # 量不準的原因（i18n 代號）
+    # 九宮格：照片四角、四邊中點、正中央各裁一塊（已拉伸的 0~255 灰階）；平均時是分數最高那張的
+    tiles: list[list[np.ndarray]] | None = None
 
     def cell(self, name: str) -> Cell | None:
         r, c = CORNERS[name] if name in CORNERS else (GRID // 2, GRID // 2)
@@ -110,6 +112,19 @@ def _axial_mean(angles: list[float], weights: list[float]) -> tuple[float, float
     return math.atan2(z.imag, z.real) / 2, abs(z) / total
 
 
+def photo_tiles(data: np.ndarray) -> list[list[np.ndarray]]:
+    """從照片的四角、四邊中點、正中央各裁一塊 TILE×TILE，用同一套自動拉伸（跟預覽一樣）轉成 0~255 的灰階。"""
+    from .preview import stretch
+
+    h, w = data.shape
+    t = max(8, min(TILE, h // GRID, w // GRID))
+    step = max(1, max(h, w) // 1000)
+    sample = data[::step, ::step]
+    rows = (0, (h - t) // 2, h - t)
+    cols = (0, (w - t) // 2, w - t)
+    return [[(stretch(data[y:y + t, x:x + t], sample) * 255).astype(np.uint8) for x in cols] for y in rows]
+
+
 def analyze_frame(path: Path) -> FieldResult:
     """量一張的像場。"""
     data, header = load_image(path)
@@ -122,21 +137,12 @@ def analyze_frame(path: Path) -> FieldResult:
     empty = [[None] * GRID for _ in range(GRID)]
     if not np.isfinite(std) or std <= 0:
         return FieldResult(empty, notes=["field.note.blank"])
-    finder = IRAFStarFinder(threshold=DETECT_SIGMA * std, fwhm=DETECT_FWHM, exclude_border=True,
-                            peak_max=sat * 0.9, roundness_range=(-5.0, 5.0), sharpness_range=(0.2, 5.0))
+    tiles = photo_tiles(data)
     sub = data - median
-    sources = finder(sub)
-    if sources is None or len(sources) == 0:
-        return FieldResult(empty, notes=["field.note.no_stars"])
-    box = uniform_filter(sub, size=3) * 9
-    xs = np.asarray(sources["x_centroid"])
-    ys = np.asarray(sources["y_centroid"])
-    xi = np.clip(np.round(xs).astype(int), 0, sub.shape[1] - 1)
-    yi = np.clip(np.round(ys).astype(int), 0, sub.shape[0] - 1)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        conc = np.where(box[yi, xi] > 0, sub[yi, xi] / box[yi, xi], np.inf)
-    keep = conc <= HOT_PIXEL_CONCENTRATION
-    xs, ys, peaks = xs[keep], ys[keep], np.asarray(sources["peak"])[keep]
+    sources = find_stars(sub, std, sat)
+    if sources is None:
+        return FieldResult(empty, notes=["field.note.no_stars"], tiles=tiles)
+    xs, ys, peaks = (np.asarray(sources[k]) for k in ("x_centroid", "y_centroid", "peak"))
 
     h, w = sub.shape
     cells: list[list[Cell | None]] = [[None] * GRID for _ in range(GRID)]
@@ -168,7 +174,7 @@ def analyze_frame(path: Path) -> FieldResult:
         notes.append("field.note.undersampled")
     if measured and float(np.median([x.eccentricity for x in measured])) > 0.6:
         notes.append("field.note.trailed")  # 整張都拖線：FWHM 被拖線拉大，傾斜的數字只能參考
-    return FieldResult(cells, notes=notes)
+    return FieldResult(cells, notes=notes, tiles=tiles)
 
 
 def combine(results: list[FieldResult]) -> FieldResult:
@@ -184,4 +190,5 @@ def combine(results: list[FieldResult]) -> FieldResult:
                                float(np.median([x.eccentricity for x in found])), angle,
                                float(np.median([x.alignment for x in found])), sum(x.n for x in found))
     notes = sorted({n for res in results for n in res.notes})
-    return FieldResult(cells, n_frames=len(results), notes=notes)
+    tiles = next((res.tiles for res in results if res.tiles is not None), None)   # 第一張（分數最高的）
+    return FieldResult(cells, n_frames=len(results), notes=notes, tiles=tiles)

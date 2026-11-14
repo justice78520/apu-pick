@@ -1,7 +1,8 @@
 """以「最佳範本」為基準的綜合評分挑片。
 
 流程：
-1. 每個指標各取整批最好的前 top_frac（預設 10%）平均，組成「範本」。
+1. 每個指標各取整批最好的前 top_frac（預設 10%）平均，組成「範本」；至少取 min_top 張（預設 3），
+   不然張數少時（不到 25 張）範本只有一張，那一張剛好特別好就會把其他的全部比下去。
 2. 每張影像每個指標換算成相對範本的比例（範本 = 1.0，上限 1.0），加權後 ×100 得到分數。
 3. 用 KDE 找分數分布的峰值（眾數），找不到就退回中位數。
 4. keep 門檻 = max(眾數 − margin_k × MAD, 100 × pass_pct)：
@@ -29,6 +30,7 @@ DEFAULT_WEIGHTS = {"fwhm": 0.35, "eccentricity": 0.30, "n_stars": 0.20, "backgro
 @dataclass
 class ScoreConfig:
     top_frac: float = 0.10     # 每個指標取最好的前幾 % 當範本
+    min_top: int = 3           # 範本至少取幾張（整組不到這麼多張就全部都算）
     pass_pct: float = 0.80     # 及格線：範本分數的百分比
     margin_k: float = 1.5      # 眾數往下容許幾個 MAD
     # MAD 下限（分數點數）：整批品質很一致時 MAD 會縮到 0.x，不加下限會把只差零點幾分的正常片 reject
@@ -50,8 +52,8 @@ class ScoreResult:
     method: str                       # 門檻怎麼來的：mode / pass_line / min_score / keep_best
 
 
-def _top_mean(values: np.ndarray, frac: float, lower_is_better: bool) -> float:
-    n = max(1, int(round(len(values) * frac)))
+def _top_mean(values: np.ndarray, frac: float, lower_is_better: bool, min_top: int = 1) -> float:
+    n = max(1, int(round(len(values) * frac)), min(min_top, len(values)))
     ordered = np.sort(values)
     top = ordered[:n] if lower_is_better else ordered[-n:]
     return float(top.mean())
@@ -88,7 +90,7 @@ def score_frames(frames: list[FrameMetrics], cfg: ScoreConfig) -> ScoreResult:
 
     lower_is_better = {"fwhm": True, "eccentricity": True, "n_stars": False, "background": True, "snr": False}
     columns = {m: np.array([getattr(f, m) for f in ok], dtype=float) for m in cfg.weights}
-    reference = {m: _top_mean(columns[m], cfg.top_frac, lower_is_better[m]) for m in cfg.weights}
+    reference = {m: _top_mean(columns[m], cfg.top_frac, lower_is_better[m], cfg.min_top) for m in cfg.weights}
 
     total_w = sum(cfg.weights.values())
     scores: dict[str, float] = {}

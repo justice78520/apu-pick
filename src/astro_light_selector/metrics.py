@@ -107,7 +107,19 @@ def _superpixel(data: np.ndarray, n: int = 2) -> np.ndarray:
     return data[:h, :w].reshape(h // n, n, w // n, n).mean(axis=(1, 3))
 
 
+def known_saturation(header: fits.Header) -> float | None:
+    """真的會爆掉的值：RAW 的白位、BITDEPTH，或 8 / 16-bit 整數的上限；32-bit 浮點不知道就回傳 None。"""
+    if header.get("SATLEVEL"):
+        return float(header["SATLEVEL"])
+    if header.get("BITDEPTH"):
+        return float(2 ** int(header["BITDEPTH"]) - 1)
+    if header.get("BITPIX", 16) in (8, 16):
+        return 255.0 if header.get("BITPIX") == 8 else 65535.0
+    return None
+
+
 def _saturation_level(header: fits.Header, data: np.ndarray) -> float:
+    """偵測星點時排除飽和星用的上限（不知道確切飽和值時以這張的最大值為準）。"""
     if header.get("SATLEVEL"):  # 相機 RAW：白位扣掉黑位
         return float(header["SATLEVEL"])
     bitpix = header.get("BITPIX", 16)
@@ -162,6 +174,33 @@ def star_fit(cutout: np.ndarray, sigma0: float) -> tuple[float, float, float] | 
     return fwhm, ecc, angle
 
 
+def find_stars(sub: np.ndarray, noise: float, sat_level: float):
+    """在扣掉背景的影像上找星點（量測和像場分析共用），回傳 photutils 的星點表；找不到是 None。
+
+    熱像素（長曝、沒扣暗場的單眼特別多）亮度全在一格裡，用 3×3 內的集中度排除。
+    """
+    finder = IRAFStarFinder(
+        threshold=DETECT_SIGMA * noise,
+        fwhm=DETECT_FWHM,
+        exclude_border=True,
+        peak_max=sat_level * 0.9,  # 排除飽和星
+        # 放寬 roundness / sharpness 過濾：拖線的星、欠取樣的小星都要能偵測到，
+        # 這樣才能靠離心率把拖線的整張 reject（IRAFStarFinder 預設 sharpness 下限 0.5 會濾掉小星）
+        roundness_range=(-5.0, 5.0),
+        sharpness_range=(0.2, 5.0),
+    )
+    sources = finder(sub)
+    if sources is None or len(sources) == 0:
+        return None
+    box = uniform_filter(sub, size=3) * 9
+    xi = np.clip(np.round(np.asarray(sources["x_centroid"])).astype(int), 0, sub.shape[1] - 1)
+    yi = np.clip(np.round(np.asarray(sources["y_centroid"])).astype(int), 0, sub.shape[0] - 1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        conc = np.where(box[yi, xi] > 0, sub[yi, xi] / box[yi, xi], np.inf)
+    sources = sources[conc <= HOT_PIXEL_CONCENTRATION]
+    return sources if len(sources) else None
+
+
 def _number(header: fits.Header, *keys: str) -> float | None:
     for key in keys:
         try:
@@ -180,7 +219,7 @@ def _text(header: fits.Header, key: str) -> str | None:
 
 
 def measure(path: Path) -> FrameMetrics:
-    """計算單張 light frame 的品質指標。失敗時回傳帶 error 的結果。"""
+    """計算單張 light frame 的品質指標。失敗時回傳帶 error 的結果，不丟例外：一張有問題不能拖累整批。"""
     base = dict(
         file=str(path), n_stars=0, fwhm=np.nan, eccentricity=np.nan,
         background=np.nan, noise=np.nan, snr=np.nan, saturated_frac=np.nan,
@@ -190,11 +229,17 @@ def measure(path: Path) -> FrameMetrics:
         data, header = load_image(path)
     except Exception as exc:  # noqa: BLE001
         return FrameMetrics(**base, error=f"read_failed:{exc}")
+    try:
+        return _measure(data, header, base)
+    except Exception as exc:  # noqa: BLE001  檔頭寫了奇怪的值、影像裡有非數值…：只有這一張算失敗
+        return FrameMetrics(**base, error=f"measure_failed:{type(exc).__name__}: {exc}")
 
+
+def _measure(data: np.ndarray, header: fits.Header, base: dict) -> FrameMetrics:
     base.update(
-        exposure=header.get("EXPTIME") or header.get("EXPOSURE"),
-        filter=header.get("FILTER"),
-        date_obs=header.get("DATE-OBS"),
+        exposure=_number(header, "EXPTIME", "EXPOSURE") or None,
+        filter=_text(header, "FILTER"),
+        date_obs=_text(header, "DATE-OBS"),
         iso=_number(header, "ISO", "ISOSPEED"),
         gain=_number(header, "GAIN"),
         camera=_text(header, "INSTRUME"),
@@ -204,7 +249,8 @@ def measure(path: Path) -> FrameMetrics:
         base.update(altitude=sky.altitude, moon_alt=sky.moon_alt, moon_sep=sky.moon_sep, moon_illum=sky.moon_illum)
 
     sat_level = _saturation_level(header, data)
-    saturated_frac = float((data >= sat_level * 0.98).mean())
+    # 飽和像素比例用確定的飽和值算（16-bit 沒寫 BITDEPTH 時是 65535）；不知道才退回這張的最大值
+    saturated_frac = float((data >= (known_saturation(header) or sat_level) * 0.98).mean())
 
     # 彩色影像先合成 super-pixel，量到的 FWHM 要乘回去還原成原始像素尺度
     scale = _cfa_bin(header)
@@ -216,27 +262,9 @@ def measure(path: Path) -> FrameMetrics:
     if not np.isfinite(bkg_std) or bkg_std <= 0:
         return FrameMetrics(**base, error="blank")
 
-    finder = IRAFStarFinder(
-        threshold=DETECT_SIGMA * bkg_std,
-        fwhm=DETECT_FWHM,
-        exclude_border=True,
-        peak_max=sat_level * 0.9,  # 排除飽和星
-        # 放寬 roundness / sharpness 過濾：拖線的星、欠取樣的小星都要能偵測到，
-        # 這樣才能靠離心率把拖線的整張 reject（IRAFStarFinder 預設 sharpness 下限 0.5 會濾掉小星）
-        roundness_range=(-5.0, 5.0),
-        sharpness_range=(0.2, 5.0),
-    )
     sub = data - bkg_median
-    sources = finder(sub)
-    if sources is not None and len(sources) > 0:
-        # 熱像素（長曝、沒扣暗場的單眼特別多）亮度全在一格裡，先排除
-        box = uniform_filter(sub, size=3) * 9
-        xi = np.clip(np.round(np.asarray(sources["x_centroid"])).astype(int), 0, sub.shape[1] - 1)
-        yi = np.clip(np.round(np.asarray(sources["y_centroid"])).astype(int), 0, sub.shape[0] - 1)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            conc = np.where(box[yi, xi] > 0, sub[yi, xi] / box[yi, xi], np.inf)
-        sources = sources[conc <= HOT_PIXEL_CONCENTRATION]
-    if sources is None or len(sources) == 0:
+    sources = find_stars(sub, bkg_std, sat_level)
+    if sources is None:
         return FrameMetrics(**base, error="no_stars")
 
     base.update(n_stars=int(len(sources)))

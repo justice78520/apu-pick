@@ -1,0 +1,63 @@
+# 用 GitHub 的雲端 Windows 打包 APU Pick 的 Windows 版，打包好的 zip 會附到那個 Release。
+# 發布 Release 時自動執行；也可以在 Actions 頁面手動執行。
+name: 打包 Windows 版
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要附上 Windows 版的 Release 標籤（例如 v0.9.0）；留空就只存成這次執行的成品"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      PYTHONUNBUFFERED: "1"  # 輸出即時出現在記錄裡，卡住時才看得出卡在哪
+      PYTHONUTF8: "1"        # 中文訊息與檔名用 UTF-8，不受雲端機的系統語系影響
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: 安裝
+        run: python -m pip install -e ".[exe]" pytest
+
+      - name: 測試（核心）
+        timeout-minutes: 20
+        # 單一測試超過 4 分鐘就印出每個執行緒卡在哪一行
+        run: python -m pytest -v --ignore=tests/test_gui.py -o faulthandler_timeout=240
+
+      # 視窗測試要用到雲端機的圖形環境；失敗會標示出來，但不擋住打包
+      - name: 測試（視窗）
+        timeout-minutes: 10
+        continue-on-error: true
+        run: python -m pytest -v tests/test_gui.py -o faulthandler_timeout=120
+
+      - name: 打包並自動測試打包好的程式
+        timeout-minutes: 30
+        run: python packaging/build_exe.py
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: APUPick-windows
+          path: dist/*.zip
+
+      - name: 附到 Release
+        if: github.event_name == 'release' || inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: gh release upload "$TAG" dist/*.zip --clobber

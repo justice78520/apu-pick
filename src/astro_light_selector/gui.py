@@ -14,6 +14,7 @@ import threading
 import time
 import tkinter as tk
 import traceback
+import webbrowser
 from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
@@ -23,12 +24,12 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 from PIL import Image, ImageTk
 
-from . import __version__
+from . import __version__, errorlog, update
 from .darkroom import (IS_MAC, Darkroom, Fonts, MetricRow, PanelGroup, ParameterSlider, ParameterToggle, Segmented,
                        Tooltip, _short_path, dark_title_bar, enable_dpi_awareness, setup_style)
 from .detail import draw_field, draw_histogram, field_lines, histogram_stats, info_lines
 from .field import analyze_frame, combine
-from .grouping import EXPOSURE_TOLERANCE, assign_nights
+from .grouping import DEFAULT_GROUP_KEYS, EXPOSURE_TOLERANCE, GROUP_KEYS, assign_nights
 from .i18n import APP_NAME, APP_SUBTITLE, LANGUAGES, get_language, set_language, tr, tr_metric
 from .metrics import FrameMetrics, is_image
 from .mover import read_move_log
@@ -166,19 +167,35 @@ class PickView(tk.Frame):
         self._started = 0.0
         self.popover: tk.Toplevel | None = None
         self.popover_owner: tk.Widget | None = None
+        # 新版本：check_for_updates() 查到比目前新的版本時才有，頂部版號旁邊出現下載鍵
+        self.update_info: update.Update | None = None
         # 狀態列存成函式，切換語言時可以用新語言重新產生
         self._status_fn: Callable[[], str] = lambda: tr("gui.status.start")
 
         self.lang_var = tk.StringVar(value=get_language())
-        self.method_var = tk.StringVar(value="auto")
-        self.pass_var = tk.DoubleVar(value=80)
-        self.min_score_var = tk.DoubleVar(value=85)
-        self.keep_best_var = tk.DoubleVar(value=70)
-        self.group_filter_var = tk.BooleanVar(value=True)
-        self.group_exposure_var = tk.BooleanVar(value=True)
-        self.group_night_var = tk.BooleanVar(value=False)
-        self.group_gain_var = tk.BooleanVar(value=True)
-        self.group_folder_var = tk.BooleanVar(value=False)
+        # 門檻方式與數值、分組開關：記住上次用的（settings.json 的 threshold、group_keys）
+        remembered = load_settings()
+        th = remembered.get("threshold") if isinstance(remembered.get("threshold"), dict) else {}
+
+        def number(key: str, default: float, low: float, high: float) -> float:
+            try:
+                v = float(th.get(key, default))
+            except (TypeError, ValueError):
+                return default
+            return v if low <= v <= high else default
+
+        method = th.get("method")
+        self.method_var = tk.StringVar(value=method if method in ("auto", "min_score", "keep_best") else "auto")
+        self.pass_var = tk.DoubleVar(value=number("pass", 80, 50, 100))
+        self.min_score_var = tk.DoubleVar(value=number("min_score", 85, 0, 100))
+        self.keep_best_var = tk.DoubleVar(value=number("keep_best", 70, 10, 100))
+        keys = remembered.get("group_keys")
+        keys = [k for k in keys if k in GROUP_KEYS] if isinstance(keys, list) else list(DEFAULT_GROUP_KEYS)
+        self.group_filter_var = tk.BooleanVar(value="filter" in keys)
+        self.group_exposure_var = tk.BooleanVar(value="exposure" in keys)
+        self.group_night_var = tk.BooleanVar(value="night" in keys)
+        self.group_gain_var = tk.BooleanVar(value="gain" in keys)
+        self.group_folder_var = tk.BooleanVar(value="folder" in keys)
         # 包含子資料夾：開資料夾時自動判斷（本身沒影像、子資料夾有；或上次的報表有子資料夾），也可以自己切換
         self.recursive_var = tk.BooleanVar(value=False)
         self._setting_folder = False
@@ -189,6 +206,9 @@ class PickView(tk.Frame):
         self._watch_job: str | None = None
         self._watch_sizes: dict[str, int] = {}
         self.only_reject_var = tk.BooleanVar(value=False)
+        # 「說明」選單的「開啟時檢查新版本」
+        self.update_check_var = tk.BooleanVar(value=update.enabled())
+        self.update_check_var.trace_add("write", lambda *_: self.set_update_check(bool(self.update_check_var.get())))
         # 整理檔案：依哪些參數分資料夾（記住上次勾的）
         organize_keys = load_settings().get("organize_keys") or list(DEFAULT_ORGANIZE_KEYS)
         self.organize_vars = {k: tk.BooleanVar(value=k in organize_keys) for k in ORGANIZE_KEYS}
@@ -209,6 +229,9 @@ class PickView(tk.Frame):
         self.hist_channel_var = tk.StringVar(value=saved.get("hist_channels", "rgb"))
         # 像場：看單張或最好幾張保留片的平均；量過的留著（換資料夾才清掉）
         self.field_mode_var = tk.StringVar(value=saved.get("field_mode", "single"))
+        # 像場怎麼畫：實際照片的九宮格，或像場四邊形
+        self.field_view_var = tk.StringVar(value=saved.get("field_view") if saved.get("field_view") in ("grid", "quad")
+                                           else "grid")
         self._field_cache: dict[str, object] = {}
         self._field_running: set[str] = set()
         self.folder_var = tk.StringVar()
@@ -245,6 +268,7 @@ class PickView(tk.Frame):
         self.hist_stretch_var.trace_add("write", lambda *_: self._hist_option_changed())
         self.hist_channel_var.trace_add("write", lambda *_: self._hist_option_changed())
         self.field_mode_var.trace_add("write", lambda *_: self._field_mode_changed())
+        self.field_view_var.trace_add("write", lambda *_: self._field_mode_changed())
         for var in self.organize_vars.values():
             var.trace_add("write", lambda *_: save_settings(organize_keys=list(self._organize_keys())))
         self.watch_var.trace_add("write", lambda *_: self._toggle_watch())
@@ -320,6 +344,17 @@ class PickView(tk.Frame):
         badge.pack(side="left", padx=(self.px(7), 0))
         tk.Label(badge, text=f"v{__version__}", font=self.fonts.badge, fg=D.beta, bg=D.chrome,
                  padx=self.px(4)).pack()
+        # 有新版才出現：跟版號同樣的小框（藍色），按一下用瀏覽器下載
+        self.update_badge = tk.Frame(identity, bg=D.accent, padx=1, pady=1, cursor="hand2")
+        self.update_label = tk.Label(self.update_badge, font=self.fonts.badge, fg=D.accent, bg=D.chrome,
+                                     padx=self.px(4), cursor="hand2")
+        self.update_label.pack()
+        for w in (self.update_badge, self.update_label):
+            w.bind("<Button-1>", lambda _e: self.open_update())
+        self.update_label.bind("<Enter>", lambda _e: self.update_label.configure(bg=D.hover))
+        self.update_label.bind("<Leave>", lambda _e: self.update_label.configure(bg=D.chrome))
+        self._update_tooltip = Tooltip(self.update_label, "", self)
+        self._show_update(self.update_info)
 
         actions = tk.Frame(bar, bg=D.chrome)
         actions.pack(side="right", padx=(0, self.px(14)))
@@ -442,6 +477,10 @@ class PickView(tk.Frame):
         self.load_btn = ttk.Button(group.body, text=tr("gui.btn.load"), style="Dark.TButton",
                                    command=self._load_report)
         self.load_btn.pack(anchor="w", pady=(self.px(10), 0))
+        self.new_btn = ttk.Button(group.body, text=tr("gui.btn.measure_new"), style="Dark.TButton",
+                                  command=self._measure_new)
+        self.new_btn.pack(anchor="w", pady=(self.px(6), 0))
+        Tooltip(self.new_btn, tr("gui.btn.measure_new.help"), self)
         group = PanelGroup(panel, self, "rejects", tr("gui.group.rejects"), tr("gui.group.rejects.info"))
         tk.Label(group.body, text=tr("gui.reject_folder"), font=self.fonts.small, fg=D.secondary,
                  bg=D.panel).pack(anchor="w")
@@ -639,19 +678,23 @@ class PickView(tk.Frame):
         self.hist_canvas.get_tk_widget().configure(bg=D.list_bg, highlightthickness=0)
         self.hist_canvas.get_tk_widget().pack(fill="both", expand=True, padx=self.px(4), pady=(self.px(4), 0))
 
-        # 像場：3×3 的 FWHM 與星點拉長方向，下面是傾斜、場曲的數字
+        # 像場：實際照片的九宮格（每格標星點大小）或像場四邊形，下面是傾斜、場曲的數字
         page = self.pane_frames["field"]
-        Segmented(page, self, [("single", tr("field.single")),
-                               ("average", tr("field.average", n=FIELD_AVERAGE_FRAMES))],
-                  self.field_mode_var).pack(anchor="w", padx=self.px(10))
-        self.field_text = tk.Text(page, height=9, wrap="word", relief="flat", bg=D.list_bg, fg=D.label,
+        row = tk.Frame(page, bg=D.list_bg)
+        row.pack(fill="x", padx=self.px(10))
+        Segmented(row, self, [("single", tr("field.single")),
+                              ("average", tr("field.average", n=FIELD_AVERAGE_FRAMES))],
+                  self.field_mode_var).pack(side="left")
+        Segmented(row, self, [("grid", tr("field.view.grid")), ("quad", tr("field.view.quad"))],
+                  self.field_view_var).pack(side="right")
+        self.field_text = tk.Text(page, height=11, wrap="word", relief="flat", bg=D.list_bg, fg=D.label,
                                   font=self.fonts.small, padx=self.px(10), highlightthickness=0, cursor="arrow",
                                   tabs=(self.px(96),))
         self.field_text.tag_configure("dim", foreground=D.secondary)
         self.field_text.tag_configure("bad", foreground=D.reject)
         self.field_text.pack(side="bottom", fill="x", pady=(0, self.px(6)))
         self.field_text.configure(state="disabled")
-        self.field_fig = Figure(figsize=(4.2, 3.0), facecolor=D.list_bg)
+        self.field_fig = Figure(figsize=(4.2, 4.2), facecolor=D.list_bg)
         self.field_canvas = FigureCanvasTkAgg(self.field_fig, master=page)
         self.field_canvas.get_tk_widget().configure(bg=D.list_bg, highlightthickness=0)
         self.field_canvas.get_tk_widget().pack(fill="both", expand=True, padx=self.px(4), pady=(self.px(4), 0))
@@ -662,7 +705,7 @@ class PickView(tk.Frame):
         self._refresh_detail()
 
     def _field_mode_changed(self) -> None:
-        save_settings(field_mode=self.field_mode_var.get())
+        save_settings(field_mode=self.field_mode_var.get(), field_view=self.field_view_var.get())
         self._refresh_detail()
 
     def _field_targets(self, key: str | None) -> tuple[str, list[str]] | None:
@@ -692,12 +735,13 @@ class PickView(tk.Frame):
                 message = tr("field.measuring")
                 if cache_key not in self._field_running:
                     self._start_field(cache_key, keys)
-        draw_field(self.field_fig, result, message)
+        view = self.field_view_var.get()
+        draw_field(self.field_fig, result, message, view)
         self.field_canvas.draw_idle()
         text = self.field_text
         text.configure(state="normal")
         text.delete("1.0", "end")
-        for line, tag in field_lines(result):
+        for line, tag in field_lines(result, view):
             text.insert("end", line, tag)
         text.configure(state="disabled")
 
@@ -958,6 +1002,50 @@ class PickView(tk.Frame):
         """有量測在跑（關閉視窗前要詢問）。"""
         return self.worker is not None and self.worker.is_alive()
 
+    # ------------------------------------------------------------------ 新版本
+
+    def check_for_updates(self) -> None:
+        """有沒有新版：先用上次查到的結果顯示，一天沒查過才在背景連 GitHub（沒網路就算了）。
+        獨立版的 main() 開窗後呼叫；嵌在別的程式裡時由外面決定要不要呼叫。"""
+        st = load_settings()
+        if not update.enabled(st):
+            self._show_update(None)
+            return
+        self._show_update(update.newer(update.cached(st)))
+        if update.due(st):
+            events = self.events
+
+            def work() -> None:
+                try:
+                    events.put(("update", update.fetch_latest()))
+                except Exception:  # noqa: BLE001  沒網路、被擋、格式不對：不打擾使用者
+                    pass
+
+            threading.Thread(target=work, daemon=True).start()
+
+    def set_update_check(self, on: bool) -> None:
+        save_settings(check_updates=bool(on))
+        if on:
+            self.check_for_updates()
+        else:
+            self._show_update(None)
+
+    def _show_update(self, info: update.Update | None) -> None:
+        self.update_info = info
+        if not hasattr(self, "update_badge"):
+            return
+        if info is None:
+            self.update_badge.pack_forget()
+        else:
+            self.update_label.configure(text=tr("gui.update.badge", version=info.version))
+            self._update_tooltip.text = tr("gui.update.help", version=info.version, current=__version__,
+                                           file=info.file or tr("gui.update.page"))
+            self.update_badge.pack(side="left", padx=(self.px(5), 0))
+
+    def open_update(self) -> None:
+        if self.update_info is not None:
+            webbrowser.open(self.update_info.url)
+
     def _refresh_all(self) -> None:
         """依目前狀態更新所有跟語言、資料有關的顯示。"""
         self.status_var.set(self._status_fn())
@@ -981,6 +1069,7 @@ class PickView(tk.Frame):
         self.move_btn.state([idle if self.selection is not None else "disabled"])
         has_report = has_folder and (folder / REPORT_NAME).is_file()
         self.load_btn.state([idle if has_report else "disabled"])
+        self.new_btn.state([idle if has_folder and self.frames else "disabled"])
         self.restore_btn.state([idle if has_folder else "disabled"])
         self.change_btn.state([idle if has_folder else "disabled"])
         custom = self.reject_var.get().strip()
@@ -1229,6 +1318,21 @@ class PickView(tk.Frame):
                                 extra=tr("gui.status.includes_rejected", n=k) if k else ""))
         self._run_measure(files, home_of, "measured")
 
+    def _measure_new(self) -> None:
+        """只量測還沒有結果的檔案（新拍的、上次按停止沒量完的），量完加進現有的結果、整批重算門檻。"""
+        folder = self._folder()
+        if folder is None or not folder.is_dir() or self.is_busy():
+            return
+        files, home_of = collect_files(folder, self._reject_dir(), self._recursive())
+        known = {frame_key(f.file, folder) for f in self.frames}
+        new = [p for p in files if frame_key(home_of.get(str(p), p), folder) not in known]
+        if not new:
+            messagebox.showinfo(APP_NAME, tr("gui.measure_new.nothing"))
+            return
+        n = len(new)
+        self._status(lambda: tr("gui.status.measuring", n=n, extra=""))
+        self._run_measure(new, home_of, "added")
+
     def _workers(self) -> int:
         try:
             return max(1, int(float(self.workers_var.get())))
@@ -1250,9 +1354,10 @@ class PickView(tk.Frame):
             frames = measure_files(files, workers, cancel=self.cancel, home_of=home_of,
                                    progress=lambda i, n, m: self.events.put(("progress", i, n, m)))
             self.events.put((kind, frames))
-        except Cancelled:
-            self.events.put(("cancelled",))
+        except Cancelled as stopped:
+            self.events.put(("cancelled", stopped.partial))
         except Exception:  # noqa: BLE001
+            errorlog.write(traceback.format_exc())
             self.events.put(("error", traceback.format_exc()))
 
     def _stop(self) -> None:
@@ -1313,7 +1418,8 @@ class PickView(tk.Frame):
                 self._handle(self.events.get_nowait())
         except queue.Empty:
             pass
-        self._poll_job = self.after(100, self._poll)
+        finally:  # 處理某個事件出錯也要繼續收後面的，不然進度、預覽會從此不動
+            self._poll_job = self.after(100, self._poll)
 
     @staticmethod
     def _progress_text(i: int, n: int, eta: float, name: str) -> str:
@@ -1343,6 +1449,11 @@ class PickView(tk.Frame):
             if self.pane_var.get() == "field":
                 self._refresh_detail()
             return
+        if kind == "update":
+            update.remember(event[1])
+            if update.enabled():
+                self._show_update(update.newer(event[1]))
+            return
         if kind == "preview_error":
             if event[1] == self._preview_name:
                 self._clear_preview(tr("gui.preview.failed", error=event[2]))
@@ -1353,17 +1464,16 @@ class PickView(tk.Frame):
             eta = (time.monotonic() - self._started) / i * (n - i)
             name = Path(m.file).name
             self._status(lambda: self._progress_text(i, n, eta, name))
-        elif kind == "watched":
+        elif kind in ("watched", "added"):
             self.worker = None
             new = event[1]
-            folder = self._folder()
-            keys = {frame_key(m.file, folder) for m in new}
-            self.frames = [f for f in self.frames if frame_key(f.file, folder) not in keys] + new
-            self._apply()
-            self._save_report()
+            self._merge_frames(new)
             latest = max(new, key=lambda m: (m.date_obs or "", m.file))
             n, name, total = len(new), Path(latest.file).name, len(self.frames)
-            self._status(lambda: tr("gui.status.watch_added", n=n, name=name, total=total))
+            if kind == "watched":
+                self._status(lambda: tr("gui.status.watch_added", n=n, name=name, total=total))
+            else:
+                self._status(lambda: tr("gui.status.added", n=n, total=total))
             self._update_buttons()
         elif kind == "measured":
             self.worker = None
@@ -1378,7 +1488,13 @@ class PickView(tk.Frame):
             self._update_buttons()
         elif kind == "cancelled":
             self.worker = None
-            self._status(lambda: tr("gui.status.cancelled"))
+            partial = event[1] if len(event) > 1 else []
+            if partial:  # 已經量好的留著，之後按「量測新檔案」補完剩下的就好
+                self._merge_frames(partial)
+                n = len(partial)
+                self._status(lambda: tr("gui.status.cancelled_kept", n=n))
+            else:
+                self._status(lambda: tr("gui.status.cancelled"))
             self.progress.configure(value=0)
             self._update_buttons()
         elif kind == "error":
@@ -1386,6 +1502,14 @@ class PickView(tk.Frame):
             self._status(lambda: tr("gui.status.failed"))
             self._update_buttons()
             messagebox.showerror(APP_NAME, tr("gui.err.measure", error=event[1][-1500:]))
+
+    def _merge_frames(self, new: list[FrameMetrics]) -> None:
+        """把剛量好的幾張加進現有的結果（同一張的舊結果換掉），整批重算門檻、存報表。"""
+        folder = self._folder()
+        keys = {frame_key(m.file, folder) for m in new}
+        self.frames = [f for f in self.frames if frame_key(f.file, folder) not in keys] + new
+        self._apply()
+        self._save_report()
 
     def _save_report(self) -> None:
         folder = self._folder()
@@ -1449,12 +1573,14 @@ class PickView(tk.Frame):
             return
         total = sum(weights.values())
         cfg.weights = {m: w / total for m, w in weights.items()}
-        save_settings(weights=weights)
         try:
             tolerance = max(0.0, float(self.exposure_tol_var.get()))
         except (tk.TclError, ValueError):
             tolerance = EXPOSURE_TOLERANCE
-        save_settings(exposure_tolerance=tolerance)
+        save_settings(weights=weights, exposure_tolerance=tolerance, group_keys=list(self._group_keys()),
+                      threshold={"method": self.method_var.get(), "pass": float(self.pass_var.get()),
+                                 "min_score": float(self.min_score_var.get()),
+                                 "keep_best": float(self.keep_best_var.get())})
         self.selection = sel = decide(self.frames, self._group_keys(), "score", cfg, exposure_tolerance=tolerance,
                                       overrides=self.overrides, root=self._folder())
         n, kept = len(sel.decisions), sel.n_keep
@@ -1664,12 +1790,15 @@ class PickView(tk.Frame):
             reverse = not last_reverse if key == last_key else False
         self._sort = (key, reverse)
 
-        def value(item: str):
+        def value(item: str) -> tuple[int, float, str]:
+            # 數字照大小、文字照字母，沒有值的「-」排最後；同一欄可能混著數字和文字（資料夾叫 20260101 和 night2）
             v = self.tree.set(item, key)
+            if v == "-":
+                return (2, 0.0, "")
             try:
-                return (0, float(v))
+                return (0, float(v), "")
             except ValueError:
-                return (1 if v == "-" else 0, v)
+                return (1, 0.0, v.lower())
 
         items = sorted(self.tree.get_children(), key=value, reverse=reverse)
         for i, item in enumerate(items):
@@ -1867,25 +1996,52 @@ class PickView(tk.Frame):
 # ---------------------------------------------------------------------- 視窗
 
 
-def _build_menubar(root: tk.Tk, view: PickView) -> None:
-    """Mac 的選單列，換掉 Tk 預設的英文選單；換語言時要重建一次。
+_last_error_dialog = 0.0
 
-    Mac 的快捷鍵慣例是放在選單項目上（⌘O 開啟資料夾）。
-    「關於」顯示系統的關於視窗（版本、圖示取自 Info.plist）；隱藏、結束由系統提供。
+
+def report_unexpected(exc_type: type[BaseException], exc: BaseException, tb: object) -> None:
+    """Tk 的回呼裡出了沒預期到的錯：記到 error.log，再跳視窗講一聲（10 秒內只跳一次，免得連環跳）。
+
+    打包成沒有主控台的程式時 stderr 是丟掉的，不這樣做使用者只會覺得「按了沒反應」。
+    """
+    global _last_error_dialog
+    path = errorlog.write_exception(exc_type, exc, tb)  # type: ignore[arg-type]
+    now = time.monotonic()
+    if now - _last_error_dialog < 10:
+        return
+    _last_error_dialog = now
+    messagebox.showerror(APP_NAME, tr("gui.err.unexpected", error=f"{exc_type.__name__}: {exc}",
+                                      log=path if path is not None else tr("gui.err.no_log")))
+
+
+def _build_menubar(root: tk.Tk, view: PickView) -> None:
+    """選單列；換語言時要重建一次。
+
+    Mac：換掉 Tk 預設的英文選單，快捷鍵照慣例放在選單項目上（⌘O 開啟資料夾）；
+    「關於」顯示系統的關於視窗（版本、圖示取自 Info.plist），隱藏、結束由系統提供。
+    Windows：檔案、說明。「說明」裡可以關掉開啟時檢查新版本。
     """
     menubar = tk.Menu(root)
-    app_menu = tk.Menu(menubar, name="apple", tearoff=False)
-    app_menu.add_command(label=tr("gui.menu.about"), command=lambda: root.tk.call("::tk::mac::standardAboutPanel"))
-    app_menu.add_separator()
-    menubar.add_cascade(menu=app_menu)
+    if IS_MAC:
+        app_menu = tk.Menu(menubar, name="apple", tearoff=False)
+        app_menu.add_command(label=tr("gui.menu.about"),
+                             command=lambda: root.tk.call("::tk::mac::standardAboutPanel"))
+        app_menu.add_separator()
+        menubar.add_cascade(menu=app_menu)
+    accel = "Command" if IS_MAC else "Ctrl"
     file_menu = tk.Menu(menubar, tearoff=False)
-    file_menu.add_command(label=tr("gui.menu.open"), accelerator="Command-O", command=view.ask_open)
+    file_menu.add_command(label=tr("gui.menu.open"), accelerator=f"{accel}-O", command=view.ask_open)
     menubar.add_cascade(label=tr("gui.menu.file"), menu=file_menu)
-    edit_menu = tk.Menu(menubar, tearoff=False)
-    edit_menu.add_command(label=tr("gui.menu.copy"), accelerator="Command-C", command=view.copy)
-    edit_menu.add_command(label=tr("gui.menu.select_all"), accelerator="Command-A", command=view.select_all)
-    menubar.add_cascade(label=tr("gui.menu.edit"), menu=edit_menu)
-    menubar.add_cascade(label=tr("gui.menu.window"), menu=tk.Menu(menubar, name="window"))
+    if IS_MAC:
+        edit_menu = tk.Menu(menubar, tearoff=False)
+        edit_menu.add_command(label=tr("gui.menu.copy"), accelerator="Command-C", command=view.copy)
+        edit_menu.add_command(label=tr("gui.menu.select_all"), accelerator="Command-A", command=view.select_all)
+        menubar.add_cascade(label=tr("gui.menu.edit"), menu=edit_menu)
+        menubar.add_cascade(label=tr("gui.menu.window"), menu=tk.Menu(menubar, name="window"))
+    help_menu = tk.Menu(menubar, tearoff=False, **({"name": "help"} if IS_MAC else {}))
+    help_menu.add_checkbutton(label=tr("gui.menu.check_updates"), variable=view.update_check_var)
+    help_menu.add_command(label=tr("gui.menu.releases"), command=lambda: webbrowser.open(update.RELEASES_URL))
+    menubar.add_cascade(label=tr("gui.menu.help"), menu=help_menu)
     root.configure(menu=menubar)
 
 
@@ -1901,6 +2057,8 @@ def main(argv: list[str] | None = None) -> int:
         set_language(lang)
     enable_dpi_awareness()
     root = tk.Tk()
+    root.report_callback_exception = report_unexpected
+    threading.excepthook = lambda args: errorlog.write_exception(args.exc_type, args.exc_value, args.exc_traceback)
     if IS_MAC:
         # Mac 的 Tk 以 72 dpi 計算，9 點的字只有 Windows（96 dpi）的四分之三大；調成一樣，兩邊的版面才一致
         root.tk.call("tk", "scaling", 96 / 72)
@@ -1922,14 +2080,12 @@ def main(argv: list[str] | None = None) -> int:
         set_language(lang)
         save_settings(language=lang)
         view.rebuild()
-        if IS_MAC:
-            _build_menubar(root, view)  # 選單文字跟著換
+        _build_menubar(root, view)  # 選單文字跟著換
 
     view = PickView(root, root, argv[0] if argv else None, on_language=change_language)
     view.pack(fill="both", expand=True)
-    if IS_MAC:
-        _build_menubar(root, view)
-    else:  # Mac 的 ⌘O 在選單列
+    _build_menubar(root, view)
+    if not IS_MAC:  # Mac 的 ⌘O 由選單列處理
         root.bind_all("<Control-o>", lambda _e: view.ask_open())
 
     def on_close() -> None:
@@ -1943,6 +2099,7 @@ def main(argv: list[str] | None = None) -> int:
         root.createcommand("::tk::mac::Quit", on_close)
         root.createcommand("::tk::mac::OpenDocument", lambda *paths: paths and view.open_folder(paths[0]))
     dark_title_bar(root)
+    root.after(1500, view.check_for_updates)
     root.mainloop()
     return 0
 

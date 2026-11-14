@@ -224,10 +224,11 @@ def histogram_stats(preview: Preview | None) -> list[Line]:
     return lines
 
 
-def draw_field(fig: Figure, result: FieldResult | None, message: str = "") -> None:
-    """像場：3×3 的 FWHM（顏色越亮越大，數字標在格子裡），白線是星點拉長的方向，長度代表拉多長。"""
-    from .field import GRID
+QUAD_GAIN = 3.0     # 四邊形把四角 FWHM 的差異放大幾倍畫（傾斜十幾 % 照比例畫幾乎看不出來）
+QUAD_LIMIT = 0.5    # 一個角最多凸出／凹進多少（相對於半邊長），差太多時不要畫出框外
 
+
+def _empty_axes(fig: Figure):
     theme = DARK
     fig.clear()
     fig.set_facecolor("#141414")
@@ -237,43 +238,125 @@ def draw_field(fig: Figure, result: FieldResult | None, message: str = "") -> No
         spine.set_color(theme["spine"])
     ax.set_xticks([])
     ax.set_yticks([])
+    return ax
+
+
+def draw_field(fig: Figure, result: FieldResult | None, message: str = "", view: str = "grid") -> None:
+    """像場。view="grid"：實際照片的九宮格，每格標那一區的星點大小；view="quad"：像場四邊形。"""
     if result is None:
-        ax.text(0.5, 0.5, message, color=theme["muted"], ha="center", va="center", transform=ax.transAxes,
+        ax = _empty_axes(fig)
+        ax.text(0.5, 0.5, message, color=DARK["muted"], ha="center", va="center", transform=ax.transAxes,
                 fontsize=8, wrap=True)
         return
-    values = np.array([[c.fwhm if c else np.nan for c in row] for row in result.cells])
-    finite = values[np.isfinite(values)]
-    lo, hi = (float(finite.min()), float(finite.max())) if len(finite) else (0.0, 1.0)
-    if hi - lo < 0.05:
-        lo, hi = lo - 0.05, hi + 0.05
-    image = ax.imshow(values, cmap="magma", vmin=lo - (hi - lo) * 0.6, vmax=hi, extent=(0, GRID, GRID, 0))
+    if view == "quad" or result.tiles is None:
+        _draw_field_quad(fig, result)
+    else:
+        _draw_field_grid(fig, result)
+
+
+def _draw_field_grid(fig: Figure, result: FieldResult) -> None:
+    """九宮格：照片四角、四邊中點、正中央各一塊拼在一起，左上角標那一區的 FWHM（px）；最大的那個角標紅色。"""
+    from .field import GRID
+
+    theme = DARK
+    ax = _empty_axes(fig)
+    tiles = result.tiles
+    t = tiles[0][0].shape[0]
+    gap = max(2, t // 32)
+    size = GRID * t + (GRID - 1) * gap
+    mosaic = np.full((size, size), 70, dtype=np.uint8)   # 格線的灰
+    for r in range(GRID):
+        for c in range(GRID):
+            y, x = r * (t + gap), c * (t + gap)
+            mosaic[y:y + t, x:x + t] = tiles[r][c][:t, :t]
+    ax.imshow(mosaic, cmap="gray", vmin=0, vmax=255, interpolation="nearest")
+    worst = result.worst_corner
+    from .field import CORNERS
+    worst_cell = CORNERS.get(worst) if worst else None
     for r, row in enumerate(result.cells):
         for c, cell in enumerate(row):
-            cx, cy = c + 0.5, r + 0.5
+            x, y = c * (t + gap) + t * 0.05, r * (t + gap) + t * 0.05
+            text = f"{cell.fwhm:.2f}" if cell is not None else "—"
+            color = theme["reject"] if (r, c) == worst_cell else theme["text"] if cell is not None else theme["muted"]
+            ax.text(x, y, text, color=color, ha="left", va="top", fontsize=8,
+                    bbox={"facecolor": "#000000", "alpha": 0.6, "edgecolor": "none", "pad": 1.5})
+    ax.set_xlim(-0.5, size - 0.5)
+    ax.set_ylim(size - 0.5, -0.5)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    fig.tight_layout(pad=0.4)
+
+
+def quad_points(result: FieldResult) -> dict[str, tuple[float, float]] | None:
+    """像場四邊形四個頂點的位置（完全平整時是 ±1 的正方形）：哪個角的 FWHM 比四角平均大就往外凸，小就往內縮。
+    差異放大 QUAD_GAIN 倍。四角有量不到的回傳 None。座標是影像方向（x 往右、y 往下）。"""
+    from .field import CORNERS, GRID
+
+    corners = result.corners
+    if corners is None:
+        return None
+    mean = float(np.mean([c.fwhm for c in corners.values()]))
+    points = {}
+    for name, (r, c) in CORNERS.items():
+        k = 1.0 + float(np.clip(QUAD_GAIN * (corners[name].fwhm / mean - 1.0), -QUAD_LIMIT, QUAD_LIMIT))
+        points[name] = ((c - GRID // 2) * k, (r - GRID // 2) * k)
+    return points
+
+
+def _draw_field_quad(fig: Figure, result: FieldResult) -> None:
+    """像場四邊形：虛線是完全平整的樣子，實線是量到的（哪個角星點大就往外凸）。九個位置標 FWHM，短線是星點拉長的方向。"""
+    from .field import CORNERS, GRID
+
+    theme = DARK
+    ax = _empty_axes(fig)
+    ax.plot([-1, 1, 1, -1, -1], [-1, -1, 1, 1, -1], color=theme["muted"], linewidth=0.8, linestyle="--")
+    points = quad_points(result)
+    if points is not None:
+        order = ("tl", "tr", "br", "bl")
+        xs = [points[k][0] for k in order]
+        ys = [points[k][1] for k in order]
+        ax.fill(xs, ys, color=theme["keep"], alpha=0.12)
+        ax.plot(xs + xs[:1], ys + ys[:1], color=theme["keep"], linewidth=1.6)
+        ax.scatter(xs, ys, color=theme["keep"], s=14, zorder=3)
+    names = {pos: name for name, pos in CORNERS.items()}
+    worst = result.worst_corner
+    for r, row in enumerate(result.cells):
+        for c, cell in enumerate(row):
+            dx, dy = c - GRID // 2, r - GRID // 2
+            name = names.get((r, c))
+            if name is not None and points is not None:   # 角落：數字放在頂點外側
+                px, py = points[name]
+                tx, ty = px + dx * 0.34, py + dy * 0.24
+            elif (dx, dy) == (0, 0) or points is None:
+                tx, ty = dx * 1.34, dy * 1.24
+            else:   # 四邊：數字放在那一邊兩個頂點裡比較凸的那個外面，才不會壓到線
+                side = [p for k, p in points.items() if (dx and CORNERS[k][1] - GRID // 2 == dx)
+                        or (dy and CORNERS[k][0] - GRID // 2 == dy)]
+                tx = dx * (max(1.0, *(abs(p[0]) for p in side)) + 0.36) if dx else 0.0
+                ty = dy * (max(1.0, *(abs(p[1]) for p in side)) + 0.26) if dy else 0.0
             if cell is None:
-                ax.text(cx, cy, "—", color=theme["muted"], ha="center", va="center", fontsize=9)
+                ax.text(tx, ty, "—", color=theme["muted"], ha="center", va="center", fontsize=9)
                 continue
-            # 亮的格子（FWHM 大）用深色的線和字，不然看不到
-            red, green, blue, _ = image.cmap(image.norm(cell.fwhm))
-            ink = "#1a1a1a" if 0.299 * red + 0.587 * green + 0.114 * blue > 0.6 else "white"
-            half = 0.42 * min(1.0, cell.eccentricity) * cell.alignment
-            dx, dy = math.cos(cell.angle) * half, math.sin(cell.angle) * half
-            ax.plot([cx - dx, cx + dx], [cy - dy, cy + dy], color=ink, linewidth=2, solid_capstyle="round")
-            ax.text(cx, r + 0.88, f"{cell.fwhm:.2f}", color=ink, ha="center", va="center", fontsize=8)
-    for i in range(1, GRID):
-        ax.axhline(i, color=theme["spine"], linewidth=0.8)
-        ax.axvline(i, color=theme["spine"], linewidth=0.8)
-    ax.set_xlim(0, GRID)
-    ax.set_ylim(GRID, 0)
-    fig.tight_layout(pad=0.6)
+            color = theme["reject"] if name is not None and name == worst else theme["text"]
+            ax.text(tx, ty - 0.09, f"{cell.fwhm:.2f}", color=color, ha="center", va="center", fontsize=9)
+            half = 0.16 * min(1.0, cell.eccentricity) * cell.alignment   # 星點拉長的方向，越長拉得越多
+            ex, ey = math.cos(cell.angle) * half, math.sin(cell.angle) * half
+            ax.plot([tx - ex, tx + ex], [ty + 0.13 - ey, ty + 0.13 + ey], color=theme["muted"], linewidth=1.6,
+                    solid_capstyle="round")
+    ax.set_xlim(-2.15, 2.15)
+    ax.set_ylim(1.95, -1.95)   # 影像方向：上面是照片的上緣
+    ax.set_aspect("equal", adjustable="box")
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    fig.tight_layout(pad=0.4)
 
 
 def _level(tilt: float) -> str:
     return tr("field.level.ok") if tilt < 10 else tr("field.level.mild") if tilt < 20 else tr("field.level.bad")
 
 
-def field_lines(result: FieldResult | None) -> list[Line]:
-    """像場圖下面的文字：傾斜、場曲、中心與四角的 FWHM、星點拉長的樣子、量不準的提醒。"""
+def field_lines(result: FieldResult | None, view: str = "grid") -> list[Line]:
+    """像場圖下面的文字：傾斜、場曲、中心與四角的 FWHM、星點拉長的樣子、圖怎麼看、量不準的提醒。"""
     if result is None:
         return []
     lines: list[Line] = []
@@ -297,7 +380,11 @@ def field_lines(result: FieldResult | None) -> list[Line]:
     row(tr("field.pattern"), tr(f"field.pattern.{pattern or 'none'}"))
     lines.append(((tr("field.frames", n=result.n_frames) if result.n_frames > 1 else tr("field.frames_single"))
                   + "\n", "dim"))
-    lines.append((tr("field.legend") + "\n", "dim"))
+    if view == "quad" or result.tiles is None:
+        lines.append((tr("field.legend.quad", gain=QUAD_GAIN) + "\n", "dim"))
+    else:
+        lines.append((tr("field.legend.grid", n=result.tiles[0][0].shape[0])
+                      + (tr("field.legend.grid_best") if result.n_frames > 1 else "") + "\n", "dim"))
     for note in result.notes:
         lines.append((tr(note) + "\n", "bad"))
     return lines

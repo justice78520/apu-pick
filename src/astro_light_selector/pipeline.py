@@ -6,6 +6,7 @@ import os
 import threading
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,7 +26,18 @@ ProgressFn = Callable[[int, int, FrameMetrics], None]
 
 
 class Cancelled(Exception):
-    """量測被使用者中止。"""
+    """量測被使用者中止。partial 是中止前已經量好的結果（照完成的順序），可以留著、之後只補量剩下的。"""
+
+    def __init__(self, partial: list[FrameMetrics] | None = None):
+        super().__init__()
+        self.partial = partial or []
+
+
+def _failed(path: Path, error: str) -> FrameMetrics:
+    """量不出來的那一張：只帶錯誤，其他欄位空白。"""
+    nan = float("nan")
+    return FrameMetrics(file=str(path), n_stars=0, fwhm=nan, eccentricity=nan, background=nan, noise=nan, snr=nan,
+                        saturated_frac=nan, exposure=None, filter=None, date_obs=None, error=error)
 
 
 def find_fits(folder: Path) -> list[Path]:
@@ -158,29 +170,62 @@ def measure_files(files: list[Path], workers: int = 1, progress: ProgressFn | No
     n = len(files)
     results: list[FrameMetrics | None] = [None] * n
 
-    def done(i: int, m: FrameMetrics, count: int) -> None:
+    def done(i: int, m: FrameMetrics) -> None:
         m.file = home_of.get(m.file, m.file)
         results[i] = m
         if progress is not None:
-            progress(count, n, m)
+            progress(sum(r is not None for r in results), n, m)
+
+    def check_cancel() -> None:
+        if cancel is not None and cancel.is_set():
+            raise Cancelled([r for r in results if r is not None])
 
     # 只有一張也放到子行程量：視窗監看時一次常只進來一張，在視窗的行程裡量會讓介面卡住
     if workers > 1:
+        broken = False
         ex = ProcessPoolExecutor(max_workers=min(workers, n))
         try:
             futures = {ex.submit(measure, f): i for i, f in enumerate(files)}
-            for count, fut in enumerate(as_completed(futures), 1):
-                if cancel is not None and cancel.is_set():
-                    raise Cancelled
-                done(futures[fut], fut.result(), count)
+            for fut in as_completed(futures):
+                check_cancel()
+                i = futures[fut]
+                try:
+                    done(i, fut.result())
+                except BrokenProcessPool:
+                    broken = True  # 有一張讓子行程整個當掉，其他還沒量完的也一起失敗：下面一張一張重來
+                    break
+                except Exception as exc:  # noqa: BLE001  measure 自己不丟例外，這裡只是保險
+                    done(i, _failed(files[i], f"measure_failed:{type(exc).__name__}: {exc}"))
         finally:
             ex.shutdown(wait=True, cancel_futures=True)
+        if broken:
+            _measure_one_by_one(files, results, done, check_cancel)
     else:
         for i, f in enumerate(files):
-            if cancel is not None and cancel.is_set():
-                raise Cancelled
-            done(i, measure(f), i + 1)
+            check_cancel()
+            done(i, measure(f))
     return results  # type: ignore[return-value]
+
+
+def _measure_one_by_one(files: list[Path], results: list[FrameMetrics | None],
+                        done: Callable[[int, FrameMetrics], None], check_cancel: Callable[[], None]) -> None:
+    """子行程當掉之後，把還沒有結果的一張一張量：這樣才知道是哪一張害的，只有那一張標成失敗。"""
+    ex = ProcessPoolExecutor(max_workers=1)
+    try:
+        for i, f in enumerate(files):
+            if results[i] is not None:
+                continue
+            check_cancel()
+            try:
+                done(i, ex.submit(measure, f).result())
+            except BrokenProcessPool:
+                done(i, _failed(f, "crashed"))
+                ex.shutdown(wait=False, cancel_futures=True)
+                ex = ProcessPoolExecutor(max_workers=1)
+            except Exception as exc:  # noqa: BLE001
+                done(i, _failed(f, f"measure_failed:{type(exc).__name__}: {exc}"))
+    finally:
+        ex.shutdown(wait=True, cancel_futures=True)
 
 
 @dataclass

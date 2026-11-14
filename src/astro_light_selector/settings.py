@@ -1,4 +1,4 @@
-"""使用者設定（目前只有介面語言），存在系統的應用程式設定資料夾。"""
+"""使用者設定（介面語言、面板狀態、權重、門檻…），存在系統的應用程式設定資料夾。"""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ import json
 import os
 import sys
 from pathlib import Path
+
+from .fileio import atomic_write
 
 # 設定資料夾的名稱（畫面上顯示的名稱在 i18n.APP_NAME）；整合版會改成 APU Astro 底下的一個區段
 APP_NAME = "APU Pick"
@@ -38,6 +40,7 @@ def save_settings(**values: object) -> None:
     data.update(values)
     try:
         settings_path().parent.mkdir(parents=True, exist_ok=True)
-        settings_path().write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        with atomic_write(settings_path()) as fh:
+            fh.write(json.dumps(data, ensure_ascii=False, indent=2))
     except OSError:
         pass

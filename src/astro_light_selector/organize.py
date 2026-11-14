@@ -12,6 +12,7 @@ import re
 import shutil
 from pathlib import Path
 
+from .fileio import atomic_write
 from .grouping import EXPOSURE_TOLERANCE, assign_nights, exposure_buckets
 from .metrics import FrameMetrics
 from .pipeline import frame_key
@@ -63,8 +64,16 @@ def read_log(folder: Path) -> dict[Path, Path]:
     if not log.is_file():
         return {}
     root = folder.resolve()
+    entries: dict[Path, Path] = {}
     with log.open(newline="", encoding="utf-8-sig") as fh:
-        return {(root / row["source"]).resolve(): (root / row["target"]).resolve() for row in csv.DictReader(fh)}
+        for row in csv.DictReader(fh):
+            if not row.get("source") or not row.get("target"):
+                continue  # 寫到一半被中斷的最後一行
+            src, target = (root / row["source"]).resolve(), (root / row["target"]).resolve()
+            entries.pop(src, None)
+            if src != target:  # 邊搬邊記時，搬回原位的寫成「原位 → 原位」
+                entries[src] = target
+    return entries
 
 
 def write_log(folder: Path, entries: dict[Path, Path]) -> None:
@@ -74,11 +83,23 @@ def write_log(folder: Path, entries: dict[Path, Path]) -> None:
         log.unlink(missing_ok=True)
         return
     root = folder.resolve()
-    with log.open("w", newline="", encoding="utf-8-sig") as fh:
+    with atomic_write(log, newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
         w.writerow(["source", "target"])
         for src, target in entries.items():
             w.writerow([src.relative_to(root).as_posix(), target.relative_to(root).as_posix()])
+
+
+def _append_log(folder: Path, src: Path, target: Path) -> None:
+    """每搬一張就補一行（同一張後面的蓋過前面的）：搬到一半被強制關掉，已經搬的也還原得回去。"""
+    log = folder / ORGANIZE_LOG
+    root = folder.resolve()
+    new = not log.exists()
+    with log.open("a", newline="", encoding="utf-8-sig" if new else "utf-8") as fh:
+        w = csv.writer(fh)
+        if new:
+            w.writerow(["source", "target"])
+        w.writerow([src.relative_to(root).as_posix(), target.relative_to(root).as_posix()])
 
 
 def plan_organize(frames: list[FrameMetrics], folder: Path, keys: tuple[str, ...],
@@ -137,6 +158,7 @@ def organize(plan: list[tuple[Path, Path]], folder: Path) -> list[tuple[Path, Pa
             log.pop(orig, None)
             if target != orig:
                 log[orig] = target
+            _append_log(folder, orig, target)
             done.append((cur, target))
             _prune_up(cur.parent, root)
     finally:
@@ -158,6 +180,7 @@ def undo_organize(folder: Path, dry_run: bool = False) -> list[tuple[Path, Path]
                 orig.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(cur), str(orig))
                 del log[orig]
+                _append_log(folder, orig, orig)
                 _prune_up(cur.parent, root)
             done.append((cur, orig))
     finally:

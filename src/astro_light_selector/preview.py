@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from .metrics import _cfa_bin, _superpixel, load_image
+from .metrics import _cfa_bin, _superpixel, known_saturation, load_image
 
 TARGET_BACKGROUND = 0.25
 SHADOW_CLIP = 2.8   # 黑點 = 中位數 − 2.8 × MAD
@@ -79,17 +79,6 @@ def stretch(channel: np.ndarray, sample: np.ndarray | None = None) -> np.ndarray
     return np.clip(_mtf(m, x), 0, 1).astype(np.float32)
 
 
-def _known_saturation(header, data: np.ndarray) -> float | None:
-    """真的會爆掉的值：RAW 的白位、BITDEPTH，或 16-bit 整數的 65535；32-bit 浮點不知道就回傳 None。"""
-    if header.get("SATLEVEL"):
-        return float(header["SATLEVEL"])
-    if header.get("BITDEPTH"):
-        return float(2 ** int(header["BITDEPTH"]) - 1)
-    if header.get("BITPIX", 16) in (8, 16):
-        return 255.0 if header.get("BITPIX") == 8 else 65535.0
-    return None
-
-
 def _samples(img: np.ndarray) -> list[np.ndarray]:
     """每個通道取樣約一百萬點（直方圖、統計用，夠了），彩色的最後再加一份合成亮度。"""
     channels = [img[..., c] for c in range(3)] if img.ndim == 3 else [img]
@@ -136,7 +125,7 @@ def make_preview(path: Path) -> Preview:
         img = _bayer_rgb(data, pattern)
     else:
         img = _superpixel(data, n) if n > 1 else data
-    saturation = _known_saturation(header, data)
+    saturation = known_saturation(header)
     hist, hist_lum, edges, background, stats = _histogram(img, saturation)
     info = {k: header[k] for k in INFO_KEYS if header.get(k) not in (None, "")}
     info["SIZE"] = (data.shape[1], data.shape[0])
